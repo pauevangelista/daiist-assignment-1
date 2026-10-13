@@ -1,26 +1,64 @@
-"""
-Assignment 1 — training pipeline.
+"""Assignment 1 - training pipeline: hotel booking cancellations."""
+import pandas as pd
 
-You're using a script for this stage. If you'd rather use a notebook,
-write train.ipynb instead and delete this file — main.py refuses to run if
-it finds both train.py and train.ipynb, so exactly one of them must exist.
+DATA_PATH = "data/hotel_bookings.csv"
+TARGET = "is_canceled"
+SAMPLE_SIZE = 18_000
+SEED = 42
 
-Replace this docstring and everything below it with your own code. When run
-via `uv run python main.py train`, this file must, start to finish, with no
-manual steps in between:
+# Split by arrival date: simulates predicting future bookings from the past
+TRAIN_END = pd.Timestamp("2016-12-31")
+VAL_END = pd.Timestamp("2017-03-31")
 
-- Load your committed dataset.
-- Apply the feature engineering, preprocessing, and train/val/test split
-  consistent with the business framing you wrote in REPORT.md.
-- Train the same model — linear regression for a regression target,
-  logistic regression for a binary one — three ways, on the same split:
-  scikit-learn, a from-scratch PyTorch loop (Session 5's manual approach:
-  raw tensors, autograd, a manual gradient-step update), and the standard
-  torch.nn.Module + torch.optim workflow.
-- Evaluate all three against each other and against a naive baseline.
-- Save whatever app.py needs to build its dashboard without retraining
-  anything.
+MONTHS = {m: i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"], 1)}
 
-How you structure the code beyond that — file layout, function
-boundaries, naming — is your call to make and be able to defend.
-"""
+# Not known at booking time, or directly encode the outcome
+LEAKY_COLS = [
+    "reservation_status",           # literally the outcome
+    "reservation_status_date",      # date the outcome happened
+    "assigned_room_type",           # assigned near check-in
+    "booking_changes",              # accumulates after booking
+    "required_car_parking_spaces",  # requested after booking
+    "total_of_special_requests",    # can be added after booking
+]
+
+
+def load_data(path=DATA_PATH):
+    df = pd.read_csv(path)
+    df["arrival_date"] = pd.to_datetime(dict(
+        year=df["arrival_date_year"],
+        month=df["arrival_date_month"].map(MONTHS),
+        day=df["arrival_date_day_of_month"]))
+    return df
+
+
+def sample_data(df, n=SAMPLE_SIZE, seed=SEED):
+    df = df.sample(n=n, random_state=seed)
+    return df.sort_values("arrival_date").reset_index(drop=True)
+
+
+def time_split(df):
+    train = df[df["arrival_date"] <= TRAIN_END]
+    val = df[(df["arrival_date"] > TRAIN_END) & (df["arrival_date"] <= VAL_END)]
+    test = df[df["arrival_date"] > VAL_END]
+    return train.copy(), val.copy(), test.copy()
+
+
+def main():
+    df = load_data()
+    print("full data:", df.shape, "| date range:",
+          df["arrival_date"].min().date(), "to", df["arrival_date"].max().date())
+
+    df = sample_data(df).drop(columns=LEAKY_COLS)
+    train, val, test = time_split(df)
+
+    for name, part in [("train", train), ("val", val), ("test", test)]:
+        print(f"{name:5s} rows={len(part):6d}  cancel_rate={part[TARGET].mean():.3f}  "
+              f"{part['arrival_date'].min().date()} -> {part['arrival_date'].max().date()}")
+
+
+# No __main__ guard on purpose: I haven't seen main.py, so this runs
+# whether it executes the file as a script or imports it.
+main()
