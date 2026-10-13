@@ -2,11 +2,17 @@
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from pathlib import Path
+
+import joblib
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import log_loss, precision_score, recall_score, roc_auc_score
 
 DATA_PATH = "data/hotel_bookings.csv"
 TARGET = "is_canceled"
 SAMPLE_SIZE = 18_000
 SEED = 42
+MODELS_DIR = Path("models")
 
 # Split by arrival date: simulates predicting future bookings from the past
 TRAIN_END = pd.Timestamp("2016-12-31")
@@ -123,11 +129,28 @@ def build_features(df, enc):
         prefix=c) for c in CATEGORICALS]
     return pd.concat([X] + dummies, axis=1).astype(float)
 
+def evaluate(y, p, threshold=0.5):
+    """Metrics for predicted probabilities p against true labels y."""
+    pred = (p >= threshold).astype(int)
+    return {
+        "auc": roc_auc_score(y, p),
+        "logloss": log_loss(y, np.clip(p, 1e-7, 1 - 1e-7)),
+        "accuracy": float((pred == y).mean()),
+        "precision": precision_score(y, pred, zero_division=0),
+        "recall": recall_score(y, pred, zero_division=0),
+    }
+
+
+def print_table(results):
+    print(f"\n{'model':<22}{'split':<6}{'auc':>7}{'logloss':>9}{'acc':>7}{'prec':>7}{'recall':>8}")
+    for (name, split), m in results.items():
+        print(f"{name:<22}{split:<6}{m['auc']:>7.3f}{m['logloss']:>9.3f}"
+              f"{m['accuracy']:>7.3f}{m['precision']:>7.3f}{m['recall']:>8.3f}")
+
 
 def main():
     df = load_data()
-    print("full data:", df.shape, "| date range:",
-          df["arrival_date"].min().date(), "to", df["arrival_date"].max().date())
+    print("full data:", df.shape)
 
     df = clean(sample_data(df).drop(columns=LEAKY_COLS))
     train, val, test = time_split(df)
@@ -141,14 +164,42 @@ def main():
     scaler = StandardScaler().fit(X_train[SCALE_COLS])
     for X in (X_train, X_val, X_test):
         X[SCALE_COLS] = scaler.transform(X[SCALE_COLS])
+    print("shapes:", X_train.shape, X_val.shape, X_test.shape)
 
-    for name, X, y in [("train", X_train, y_train), ("val", X_val, y_val),
-                       ("test", X_test, y_test)]:
-        print(f"{name:5s} X={X.shape}  cancel_rate={y.mean():.3f}  NaNs={int(X.isna().sum().sum())}")
+    Xtr, Xva, Xte = X_train.to_numpy(), X_val.to_numpy(), X_test.to_numpy()
+    results = {}
 
-    corr = X_train.corrwith(pd.Series(y_train, index=X_train.index))
-    print("\nstrongest correlations with cancellation (train):")
-    print(corr.reindex(corr.abs().sort_values(ascending=False).index).head(10).round(3))
+    # --- naive baseline: always predict the training cancellation rate ---
+    for split, y in [("val", y_val), ("test", y_test)]:
+        results[("baseline", split)] = evaluate(y, np.full(len(y), y_train.mean()))
+
+    # --- scikit-learn: pick C on validation log loss (the only knob we tune) ---
+    best_C, best_ll = None, np.inf
+    for C in [0.01, 0.1, 1.0, 10.0]:
+        m = LogisticRegression(C=C, max_iter=2000).fit(Xtr, y_train)
+        ll = log_loss(y_val, m.predict_proba(Xva)[:, 1])
+        print(f"sklearn C={C:<6} val logloss={ll:.4f}")
+        if ll < best_ll:
+            best_C, best_ll = C, ll
+    print("chosen C =", best_C)
+
+    sk = LogisticRegression(C=best_C, max_iter=2000).fit(Xtr, y_train)
+    for split, X, y in [("val", Xva, y_val), ("test", Xte, y_test)]:
+        results[("sklearn", split)] = evaluate(y, sk.predict_proba(X)[:, 1])
+
+    print_table(results)
+
+    # --- save everything the app will need (it must never retrain) ---
+    MODELS_DIR.mkdir(exist_ok=True)
+    joblib.dump(sk, MODELS_DIR / "sklearn_logreg.joblib")
+    joblib.dump({"enc": enc, "scaler": scaler, "scale_cols": SCALE_COLS,
+                 "columns": list(X_train.columns), "best_C": best_C},
+                MODELS_DIR / "preprocessing.joblib")
+    np.savez_compressed(MODELS_DIR / "splits.npz",
+                        X_train=Xtr.astype("float32"), y_train=y_train,
+                        X_val=Xva.astype("float32"), y_val=y_val,
+                        X_test=Xte.astype("float32"), y_test=y_test)
+    print("\nsaved to", MODELS_DIR.resolve())
 
 
 # No __main__ guard on purpose: I haven't seen main.py, so this runs
