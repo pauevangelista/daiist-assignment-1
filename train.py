@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
+import torch
 
 import joblib
 from sklearn.linear_model import LogisticRegression
@@ -147,7 +148,32 @@ def print_table(results):
         print(f"{name:<22}{split:<6}{m['auc']:>7.3f}{m['logloss']:>9.3f}"
               f"{m['accuracy']:>7.3f}{m['precision']:>7.3f}{m['recall']:>8.3f}")
 
+def train_manual(X, y, C, lr, epochs):
+    """Logistic regression by hand: raw tensors, autograd, manual update."""
+    n, d = X.shape
+    lam = 1.0 / (C * n)                       # converts sklearn's C to a mean-loss penalty
+    w = torch.zeros(d, requires_grad=True)    # weights (convex problem, so zeros is fine)
+    b = torch.zeros(1, requires_grad=True)    # intercept
 
+    for epoch in range(epochs):
+        z = X @ w + b                         # 1. linear scores (logits)
+        p = torch.sigmoid(z).clamp(1e-7, 1 - 1e-7)   # 2. probabilities
+        bce = -(y * torch.log(p) + (1 - y) * torch.log(1 - p)).mean()   # 3. loss by hand
+        loss = bce + 0.5 * lam * (w ** 2).sum()      # 4. L2 penalty on w only, not b
+        loss.backward()                       # 5. autograd fills w.grad and b.grad
+        with torch.no_grad():                 # 6. update must not be tracked by autograd
+            w -= lr * w.grad
+            b -= lr * b.grad
+        w.grad.zero_()                        # 7. gradients accumulate, so reset them
+        b.grad.zero_()
+    return w.detach(), b.detach()
+
+
+def predict_manual(X, w, b):
+    with torch.no_grad():
+        return torch.sigmoid(X @ w + b).numpy()
+
+    
 def main():
     df = load_data()
     print("full data:", df.shape)
@@ -186,14 +212,39 @@ def main():
     sk = LogisticRegression(C=best_C, max_iter=2000).fit(Xtr, y_train)
     for split, X, y in [("val", Xva, y_val), ("test", Xte, y_test)]:
         results[("sklearn", split)] = evaluate(y, sk.predict_proba(X)[:, 1])
+    # --- manual PyTorch: full-batch gradient descent, C matched to sklearn ---
+    Xtr_t = torch.tensor(Xtr, dtype=torch.float32)
+    Xva_t = torch.tensor(Xva, dtype=torch.float32)
+    Xte_t = torch.tensor(Xte, dtype=torch.float32)
+    ytr_t = torch.tensor(y_train, dtype=torch.float32)
 
+    best_lr, best_ll, best_wb = None, np.inf, None
+    for lr in [0.05, 0.1, 0.3]:               # learning rate is the only knob tuned
+        w, b = train_manual(Xtr_t, ytr_t, C=best_C, lr=lr, epochs=5000)
+        ll = log_loss(y_val, predict_manual(Xva_t, w, b))
+        print(f"manual lr={lr:<5} val logloss={ll:.4f}")
+        if ll < best_ll:
+            best_lr, best_ll, best_wb = lr, ll, (w, b)
+    w_man, b_man = best_wb
+    print("chosen manual lr =", best_lr)
+
+    for split, X, y in [("val", Xva_t, y_val), ("test", Xte_t, y_test)]:
+        results[("manual_torch", split)] = evaluate(y, predict_manual(X, w_man, b_man))
+
+    # agreement check against sklearn: same model, so these should be close
+    p_sk = sk.predict_proba(Xte)[:, 1]
+    p_man = predict_manual(Xte_t, w_man, b_man)
+    print("max |w_manual - w_sklearn| =", float(np.abs(w_man.numpy() - sk.coef_[0]).max()))
+    print("max |p_manual - p_sklearn| on test =", float(np.abs(p_man - p_sk).max()))
     print_table(results)
 
     # --- save everything the app will need (it must never retrain) ---
     MODELS_DIR.mkdir(exist_ok=True)
     joblib.dump(sk, MODELS_DIR / "sklearn_logreg.joblib")
+    torch.save({"w": w_man, "b": b_man, "lr": best_lr}, MODELS_DIR / "manual_torch.pt")
     joblib.dump({"enc": enc, "scaler": scaler, "scale_cols": SCALE_COLS,
-                 "columns": list(X_train.columns), "best_C": best_C},
+                 "columns": list(X_train.columns), "best_C": best_C,
+                 "best_lr_manual": best_lr},
                 MODELS_DIR / "preprocessing.joblib")
     np.savez_compressed(MODELS_DIR / "splits.npz",
                         X_train=Xtr.astype("float32"), y_train=y_train,
