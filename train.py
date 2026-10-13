@@ -173,7 +173,14 @@ def predict_manual(X, w, b):
     with torch.no_grad():
         return torch.sigmoid(X @ w + b).numpy()
 
-    
+
+def penalized_loss(X, y, w, b, C):
+    n = X.shape[0]
+    p = torch.sigmoid(X @ w + b).clamp(1e-7, 1 - 1e-7)
+    bce = -(y * torch.log(p) + (1 - y) * torch.log(1 - p)).mean()
+    return float(bce + 0.5 / (C * n) * (w ** 2).sum())
+
+
 def main():
     df = load_data()
     print("full data:", df.shape)
@@ -219,8 +226,8 @@ def main():
     ytr_t = torch.tensor(y_train, dtype=torch.float32)
 
     best_lr, best_ll, best_wb = None, np.inf, None
-    for lr in [0.05, 0.1, 0.3]:               # learning rate is the only knob tuned
-        w, b = train_manual(Xtr_t, ytr_t, C=best_C, lr=lr, epochs=5000)
+    for lr in [0.3, 0.6, 1.0]:
+        w, b = train_manual(Xtr_t, ytr_t, C=best_C, lr=lr, epochs=20000)
         ll = log_loss(y_val, predict_manual(Xva_t, w, b))
         print(f"manual lr={lr:<5} val logloss={ll:.4f}")
         if ll < best_ll:
@@ -237,6 +244,11 @@ def main():
     print("max |w_manual - w_sklearn| =", float(np.abs(w_man.numpy() - sk.coef_[0]).max()))
     print("max |p_manual - p_sklearn| on test =", float(np.abs(p_man - p_sk).max()))
     print_table(results)
+
+    w_sk = torch.tensor(sk.coef_[0], dtype=torch.float32)
+    b_sk = torch.tensor(sk.intercept_, dtype=torch.float32)
+    print("objective sklearn:", penalized_loss(Xtr_t, ytr_t, w_sk, b_sk, best_C))
+    print("objective manual :", penalized_loss(Xtr_t, ytr_t, w_man, b_man, best_C))
 
     # --- save everything the app will need (it must never retrain) ---
     MODELS_DIR.mkdir(exist_ok=True)
