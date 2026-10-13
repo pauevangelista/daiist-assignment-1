@@ -1,23 +1,45 @@
-"""Assignment 1 - training pipeline: hotel booking cancellations."""
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
+"""Assignment 1 - training pipeline: hotel booking cancellations.
+
+Business problem: at booking time, predict which bookings will be cancelled so a
+revenue manager can decide how many rooms to overbook.
+
+Run via:  uv run python main.py train
+Loads the committed CSV, cleans it, engineers features, splits by arrival date,
+trains logistic regression three ways on the same split (scikit-learn, manual
+PyTorch loop, nn.Module + torch.optim), compares them with a naive baseline, and
+saves everything app.py needs into models/.
+"""
+import json
 from pathlib import Path
-import torch
 
 import joblib
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, precision_score, recall_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
 
 DATA_PATH = "data/hotel_bookings.csv"
+MODELS_DIR = Path("models")
 TARGET = "is_canceled"
 SAMPLE_SIZE = 18_000
 SEED = 42
-MODELS_DIR = Path("models")
 
 # Split by arrival date: simulates predicting future bookings from the past
 TRAIN_END = pd.Timestamp("2016-12-31")
 VAL_END = pd.Timestamp("2017-03-31")
+
+# Business costs, in units of one night's room rate (ADR).
+# Positive class = "will cancel", so flagging a booking means overbooking against it.
+COST_FN = 1.0   # missed cancellation -> room sits empty -> ~1 night of lost revenue
+COST_FP = 1.5   # false alarm -> guest shows up, no room -> compensation + goodwill
+
+# Optimisation settings shared by the two PyTorch versions
+C_GRID = [0.01, 0.1, 1.0, 10.0]      # sklearn C (inverse regularisation strength)
+LR_GRID = [0.3, 0.6, 1.0]            # learning rates tried for the PyTorch loops
+EPOCHS = 20_000                      # full-batch gradient steps
 
 MONTHS = {m: i for i, m in enumerate(
     ["January", "February", "March", "April", "May", "June", "July",
@@ -130,6 +152,8 @@ def build_features(df, enc):
         prefix=c) for c in CATEGORICALS]
     return pd.concat([X] + dummies, axis=1).astype(float)
 
+
+# ---------- evaluation ----------
 def evaluate(y, p, threshold=0.5):
     """Metrics for predicted probabilities p against true labels y."""
     pred = (p >= threshold).astype(int)
@@ -148,23 +172,38 @@ def print_table(results):
         print(f"{name:<22}{split:<6}{m['auc']:>7.3f}{m['logloss']:>9.3f}"
               f"{m['accuracy']:>7.3f}{m['precision']:>7.3f}{m['recall']:>8.3f}")
 
+
+def booking_cost(y, p, threshold):
+    """Average business cost per booking (in ADR-nights) when flagging p >= threshold."""
+    flagged = p >= threshold
+    fp = int((flagged & (y == 0)).sum())
+    fn = int((~flagged & (y == 1)).sum())
+    return (fp * COST_FP + fn * COST_FN) / len(y)
+
+
+def best_threshold(y, p):
+    grid = np.linspace(0.05, 0.95, 91)
+    return float(grid[int(np.argmin([booking_cost(y, p, t) for t in grid]))])
+
+
+# ---------- model 2: logistic regression by hand (Session 5 style) ----------
 def train_manual(X, y, C, lr, epochs):
-    """Logistic regression by hand: raw tensors, autograd, manual update."""
+    """Raw tensors, autograd for the gradient, manual gradient-descent update."""
     n, d = X.shape
     lam = 1.0 / (C * n)                       # converts sklearn's C to a mean-loss penalty
     w = torch.zeros(d, requires_grad=True)    # weights (convex problem, so zeros is fine)
     b = torch.zeros(1, requires_grad=True)    # intercept
 
-    for epoch in range(epochs):
-        z = X @ w + b                         # 1. linear scores (logits)
-        p = torch.sigmoid(z).clamp(1e-7, 1 - 1e-7)   # 2. probabilities
+    for _ in range(epochs):
+        z = X @ w + b                                                   # 1. logits
+        p = torch.sigmoid(z).clamp(1e-7, 1 - 1e-7)                      # 2. probabilities
         bce = -(y * torch.log(p) + (1 - y) * torch.log(1 - p)).mean()   # 3. loss by hand
-        loss = bce + 0.5 * lam * (w ** 2).sum()      # 4. L2 penalty on w only, not b
-        loss.backward()                       # 5. autograd fills w.grad and b.grad
-        with torch.no_grad():                 # 6. update must not be tracked by autograd
+        loss = bce + 0.5 * lam * (w ** 2).sum()                         # 4. L2 on w only
+        loss.backward()                                                 # 5. autograd
+        with torch.no_grad():                                           # 6. manual update
             w -= lr * w.grad
             b -= lr * b.grad
-        w.grad.zero_()                        # 7. gradients accumulate, so reset them
+        w.grad.zero_()                                                  # 7. reset grads
         b.grad.zero_()
     return w.detach(), b.detach()
 
@@ -175,18 +214,53 @@ def predict_manual(X, w, b):
 
 
 def penalized_loss(X, y, w, b, C):
+    """The objective sklearn and the manual loop both minimise (lower = closer to optimum)."""
     n = X.shape[0]
     p = torch.sigmoid(X @ w + b).clamp(1e-7, 1 - 1e-7)
     bce = -(y * torch.log(p) + (1 - y) * torch.log(1 - p)).mean()
     return float(bce + 0.5 / (C * n) * (w ** 2).sum())
 
 
+# ---------- model 3: standard PyTorch workflow ----------
+def train_nn(X, y, C, lr, epochs):
+    """nn.Module + loss object + torch.optim."""
+    n, d = X.shape
+    lam = 1.0 / (C * n)                        # same C -> penalty conversion as manual
+    model = nn.Linear(d, 1)
+    nn.init.zeros_(model.weight)
+    nn.init.zeros_(model.bias)
+    loss_fn = nn.BCEWithLogitsLoss()           # sigmoid + BCE in one stable op (mean)
+    opt = torch.optim.SGD(                     # weight_decay=lam adds lam*w to the gradient,
+        [{"params": [model.weight], "weight_decay": lam},   # equal to the 0.5*lam*||w||^2 penalty
+         {"params": [model.bias], "weight_decay": 0.0}],    # bias not penalised, like sklearn
+        lr=lr)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = loss_fn(model(X).squeeze(1), y)
+        loss.backward()
+        opt.step()
+    return model
+
+
+def predict_nn(model, X):
+    with torch.no_grad():
+        return torch.sigmoid(model(X).squeeze(1)).numpy()
+
+
 def main():
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    # ----- data, cleaning, split, features -----
     df = load_data()
-    print("full data:", df.shape)
+    print("full data:", df.shape, "| date range:",
+          df["arrival_date"].min().date(), "to", df["arrival_date"].max().date())
 
     df = clean(sample_data(df).drop(columns=LEAKY_COLS))
     train, val, test = time_split(df)
+    for name, part in [("train", train), ("val", val), ("test", test)]:
+        print(f"{name:5s} rows={len(part):6d} cancel_rate={part[TARGET].mean():.3f} "
+              f"{part['arrival_date'].min().date()} -> {part['arrival_date'].max().date()}")
 
     enc = fit_encoders(train)
     X_train = build_features(train, enc)
@@ -194,21 +268,22 @@ def main():
     X_test = build_features(test, enc)
     y_train, y_val, y_test = (p[TARGET].to_numpy() for p in (train, val, test))
 
-    scaler = StandardScaler().fit(X_train[SCALE_COLS])
+    scaler = StandardScaler().fit(X_train[SCALE_COLS])      # fit on train only
     for X in (X_train, X_val, X_test):
         X[SCALE_COLS] = scaler.transform(X[SCALE_COLS])
-    print("shapes:", X_train.shape, X_val.shape, X_test.shape)
+    print("feature shapes:", X_train.shape, X_val.shape, X_test.shape)
 
+    columns = list(X_train.columns)
     Xtr, Xva, Xte = X_train.to_numpy(), X_val.to_numpy(), X_test.to_numpy()
     results = {}
 
-    # --- naive baseline: always predict the training cancellation rate ---
+    # ----- naive baseline: always predict the training cancellation rate -----
     for split, y in [("val", y_val), ("test", y_test)]:
         results[("baseline", split)] = evaluate(y, np.full(len(y), y_train.mean()))
 
-    # --- scikit-learn: pick C on validation log loss (the only knob we tune) ---
+    # ----- model 1: scikit-learn (the only tuned knob is C, picked on val logloss) -----
     best_C, best_ll = None, np.inf
-    for C in [0.01, 0.1, 1.0, 10.0]:
+    for C in C_GRID:
         m = LogisticRegression(C=C, max_iter=2000).fit(Xtr, y_train)
         ll = log_loss(y_val, m.predict_proba(Xva)[:, 1])
         print(f"sklearn C={C:<6} val logloss={ll:.4f}")
@@ -219,52 +294,103 @@ def main():
     sk = LogisticRegression(C=best_C, max_iter=2000).fit(Xtr, y_train)
     for split, X, y in [("val", Xva, y_val), ("test", Xte, y_test)]:
         results[("sklearn", split)] = evaluate(y, sk.predict_proba(X)[:, 1])
-    # --- manual PyTorch: full-batch gradient descent, C matched to sklearn ---
+
+    # ----- tensors shared by both PyTorch versions -----
     Xtr_t = torch.tensor(Xtr, dtype=torch.float32)
     Xva_t = torch.tensor(Xva, dtype=torch.float32)
     Xte_t = torch.tensor(Xte, dtype=torch.float32)
     ytr_t = torch.tensor(y_train, dtype=torch.float32)
 
+    # ----- model 2: manual PyTorch, full batch, C matched to sklearn -----
     best_lr, best_ll, best_wb = None, np.inf, None
-    for lr in [0.3, 0.6, 1.0]:
-        w, b = train_manual(Xtr_t, ytr_t, C=best_C, lr=lr, epochs=20000)
+    for lr in LR_GRID:                          # learning rate is the only knob tuned
+        w, b = train_manual(Xtr_t, ytr_t, C=best_C, lr=lr, epochs=EPOCHS)
         ll = log_loss(y_val, predict_manual(Xva_t, w, b))
         print(f"manual lr={lr:<5} val logloss={ll:.4f}")
         if ll < best_ll:
             best_lr, best_ll, best_wb = lr, ll, (w, b)
     w_man, b_man = best_wb
     print("chosen manual lr =", best_lr)
-
     for split, X, y in [("val", Xva_t, y_val), ("test", Xte_t, y_test)]:
         results[("manual_torch", split)] = evaluate(y, predict_manual(X, w_man, b_man))
 
-    # agreement check against sklearn: same model, so these should be close
+    # ----- model 3: nn.Module + torch.optim, same lr / epochs / C as manual -----
+    nn_model = train_nn(Xtr_t, ytr_t, C=best_C, lr=best_lr, epochs=EPOCHS)
+    for split, X, y in [("val", Xva_t, y_val), ("test", Xte_t, y_test)]:
+        results[("nn_torch", split)] = evaluate(y, predict_nn(nn_model, X))
+
+    # ----- do the three agree? -----
     p_sk = sk.predict_proba(Xte)[:, 1]
     p_man = predict_manual(Xte_t, w_man, b_man)
+    p_nn = predict_nn(nn_model, Xte_t)
+    print("\nagreement on test probabilities (max abs difference):")
+    print("  manual vs sklearn:", float(np.abs(p_man - p_sk).max()))
+    print("  nn     vs manual :", float(np.abs(p_nn - p_man).max()))
+    print("  nn     vs sklearn:", float(np.abs(p_nn - p_sk).max()))
     print("max |w_manual - w_sklearn| =", float(np.abs(w_man.numpy() - sk.coef_[0]).max()))
-    print("max |p_manual - p_sklearn| on test =", float(np.abs(p_man - p_sk).max()))
-    print_table(results)
 
+    # Both methods minimise the same penalised loss; the lower value is closer to the optimum
     w_sk = torch.tensor(sk.coef_[0], dtype=torch.float32)
     b_sk = torch.tensor(sk.intercept_, dtype=torch.float32)
+    w_nn = nn_model.weight.detach().squeeze(0)
+    b_nn = nn_model.bias.detach()
     print("objective sklearn:", penalized_loss(Xtr_t, ytr_t, w_sk, b_sk, best_C))
     print("objective manual :", penalized_loss(Xtr_t, ytr_t, w_man, b_man, best_C))
+    print("objective nn     :", penalized_loss(Xtr_t, ytr_t, w_nn, b_nn, best_C))
 
-    # --- save everything the app will need (it must never retrain) ---
+    print_table(results)
+
+    # ----- ablation: is the suspicious deposit_type quirk doing the work? -----
+    keep = [i for i, c in enumerate(columns) if not c.startswith("deposit_type_")]
+    sk_nodep = LogisticRegression(C=best_C, max_iter=2000).fit(Xtr[:, keep], y_train)
+    ablation = {}
+    print("\nablation: sklearn without deposit_type")
+    for split, X, y in [("val", Xva, y_val), ("test", Xte, y_test)]:
+        m = evaluate(y, sk_nodep.predict_proba(X[:, keep])[:, 1])
+        ablation[split] = m
+        print(f"  {split:<5} auc={m['auc']:.3f} logloss={m['logloss']:.3f} "
+              f"recall={m['recall']:.3f} (with deposit_type: "
+              f"auc={results[('sklearn', split)]['auc']:.3f})")
+
+    # ----- business cost: threshold chosen on val, judged on test -----
+    p_val = sk.predict_proba(Xva)[:, 1]
+    t_star = best_threshold(y_val, p_val)
+    cost = {
+        "never_flag_test": booking_cost(y_test, np.zeros(len(y_test)), 0.5),
+        "threshold_0.5_test": booking_cost(y_test, p_sk, 0.5),
+        "val_best_threshold": t_star,
+        "val_best_threshold_test_cost": booking_cost(y_test, p_sk, t_star),
+    }
+    print(f"\nbusiness cost per booking, in ADR-nights (FN={COST_FN}, FP={COST_FP}):")
+    print(f"  never flag anyone      : {cost['never_flag_test']:.3f}")
+    print(f"  sklearn @ threshold 0.5: {cost['threshold_0.5_test']:.3f}")
+    print(f"  sklearn @ val-best {t_star:.2f} : {cost['val_best_threshold_test_cost']:.3f}")
+
+    # ----- save everything the app needs (it must never retrain) -----
     MODELS_DIR.mkdir(exist_ok=True)
     joblib.dump(sk, MODELS_DIR / "sklearn_logreg.joblib")
     torch.save({"w": w_man, "b": b_man, "lr": best_lr}, MODELS_DIR / "manual_torch.pt")
+    torch.save(nn_model.state_dict(), MODELS_DIR / "nn_torch.pt")
     joblib.dump({"enc": enc, "scaler": scaler, "scale_cols": SCALE_COLS,
-                 "columns": list(X_train.columns), "best_C": best_C,
-                 "best_lr_manual": best_lr},
+                 "columns": columns, "best_C": best_C, "best_lr": best_lr},
                 MODELS_DIR / "preprocessing.joblib")
     np.savez_compressed(MODELS_DIR / "splits.npz",
                         X_train=Xtr.astype("float32"), y_train=y_train,
                         X_val=Xva.astype("float32"), y_val=y_val,
                         X_test=Xte.astype("float32"), y_test=y_test)
+    with open(MODELS_DIR / "metrics.json", "w") as f:
+        json.dump({
+            "results": {f"{k[0]}|{k[1]}": {m: float(v) for m, v in d.items()}
+                        for k, d in results.items()},
+            "ablation_no_deposit": {s: {m: float(v) for m, v in d.items()}
+                                    for s, d in ablation.items()},
+            "cost": {"cost_fn": COST_FN, "cost_fp": COST_FP, **cost},
+            "config": {"best_C": best_C, "best_lr": best_lr, "epochs": EPOCHS,
+                       "n_train": len(y_train), "n_val": len(y_val), "n_test": len(y_test)},
+        }, f, indent=2)
     print("\nsaved to", MODELS_DIR.resolve())
 
 
-# No __main__ guard on purpose: I haven't seen main.py, so this runs
-# whether it executes the file as a script or imports it.
+# No __main__ guard on purpose: this runs whether main.py executes the file as a
+# script or imports it.
 main()
